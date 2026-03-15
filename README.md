@@ -137,3 +137,143 @@ INSERT INTO calls (employee_id, call_time, phone, direction, status) VALUES
 SELECT COUNT(*) FROM calls;
 SELECT * FROM calls;
 ```
+
+## Telephony data
+<img width="1190" height="561" alt="Screenshot 2026-03-23 110804" src="https://github.com/user-attachments/assets/018a02a8-2dda-4d06-b32b-86183cedabfb" />
+
+## Support calls dag
+
+```python
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.mysql.hooks.mysql import MySqlHook
+from airflow.models import Variable
+from datetime import datetime, timedelta
+import pandas as pd
+import duckdb
+import json
+import os
+
+
+TELEPHONY_DIR = "/usr/local/airflow/dags/telephony_data"
+DUCKDB_PATH = "/tmp/support_calls.duckdb"
+
+
+def _detect_new_calls(ti):
+    hook = MySqlHook(mysql_conn_id='mysql_as2')
+    last_time = Variable.get("last_loaded_call_time", default_var="2000-01-01 00:00:00")
+
+    sql = f"SELECT call_id, employee_id, call_time, phone, direction, status FROM calls WHERE call_time > '{last_time}'"
+    df = hook.get_pandas_df(sql)
+
+    if df.empty:
+        print("No new calls found.")
+        return []
+
+    print(f"New calls detected: {len(df)}")
+    ti.xcom_push(key='new_calls_df', value=df.to_json())
+    return df['call_id'].tolist()
+
+
+def _load_telephony_details(ti):
+    call_ids = ti.xcom_pull(task_ids='detect_new_calls')
+    if not call_ids:
+        return []
+
+    telephony_data = []
+    rejected_count = 0
+
+    for cid in call_ids:
+        file_path = os.path.join(TELEPHONY_DIR, f"call_{cid}.json")
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+                if all(k in data for k in ('duration_sec', 'short_description')) and data['duration_sec'] >= 0:
+                    telephony_data.append(data)
+                else:
+                    rejected_count += 1
+        else:
+            print(f"File missing: {file_path}")
+            rejected_count += 1
+
+    print(f"Loaded {len(telephony_data)} JSONs. Rejected: {rejected_count}")
+    return telephony_data
+
+
+def _transform_and_load_duckdb(ti):
+    calls_json = ti.xcom_pull(key='new_calls_df', task_ids='detect_new_calls')
+    telephony_list = ti.xcom_pull(task_ids='load_telephony_details')
+
+    if not calls_json or not telephony_list:
+        print("Nothing to load into DuckDB.")
+        return
+
+    df_calls = pd.read_json(calls_json)
+    df_telephony = pd.DataFrame(telephony_list)
+
+    hook = MySqlHook(mysql_conn_id='mysql_as2')
+    df_employees = hook.get_pandas_df("SELECT employee_id, full_name, team FROM employees")
+
+    final_df = df_calls.merge(df_employees, on='employee_id').merge(df_telephony, on='call_id')
+
+    if final_df.empty:
+        print("No rows after join.")
+        return
+
+    print(f"Rows after join: {len(final_df)}")
+
+    con = duckdb.connect(DUCKDB_PATH)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS support_call_enriched (
+            call_id INTEGER PRIMARY KEY,
+            employee_id INTEGER,
+            call_time TIMESTAMP,
+            phone VARCHAR,
+            direction VARCHAR,
+            status VARCHAR,
+            full_name VARCHAR,
+            team VARCHAR,
+            duration_sec INTEGER,
+            short_description TEXT
+        )
+    """)
+
+
+    call_ids_str = ','.join(str(i) for i in final_df['call_id'].tolist())
+    con.execute(f"DELETE FROM support_call_enriched WHERE call_id IN ({call_ids_str})")
+    con.execute("INSERT INTO support_call_enriched SELECT * FROM final_df")
+
+    total = con.execute("SELECT COUNT(*) FROM support_call_enriched").fetchone()[0]
+    print(f"Inserted {len(final_df)} rows. Total in DuckDB: {total}")
+
+    new_watermark = str(df_calls['call_time'].max())
+    Variable.set("last_loaded_call_time", new_watermark)
+    print(f"Watermark updated to: {new_watermark}")
+    con.close()
+
+
+default_args = {
+    "owner": "airflow",
+    "start_date": datetime(2026, 3, 1),
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+with DAG(
+        "hourly_support_pipeline",
+        default_args=default_args,
+        schedule="0 * * * *",
+        catchup=False
+) as dag:
+    t1 = PythonOperator(task_id="detect_new_calls",          python_callable=_detect_new_calls)
+    t2 = PythonOperator(task_id="load_telephony_details",    python_callable=_load_telephony_details)
+    t3 = PythonOperator(task_id="transform_and_load_duckdb", python_callable=_transform_and_load_duckdb)
+
+    t1 >> t2 >> t3
+```
+
+## Result
+
+<img width="1237" height="350" alt="Screenshot 2026-03-23 100757" src="https://github.com/user-attachments/assets/0342ffb7-2ee1-4df9-88cc-85ca552559a2" />
+
+
